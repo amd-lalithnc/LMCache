@@ -228,6 +228,14 @@ def CreateGPUConnector(
             )
 
             return VLLMPagedMemHPUConnectorV2.from_metadata(metadata, use_gpu, device)
+        elif torch_device_type == "cpu":
+            # Pure-torch CPU gather/scatter (no c_ops / CUDA streams).
+            # First Party
+            from lmcache.v1.gpu_connector.cpu_connector import VLLMCPUConnector
+
+            return VLLMCPUConnector.from_metadata(
+                metadata, use_gpu, device, layout_hints=layout_hints
+            )
         else:
             raise RuntimeError(f"No supported {torch_device_type} connector found.")
 
