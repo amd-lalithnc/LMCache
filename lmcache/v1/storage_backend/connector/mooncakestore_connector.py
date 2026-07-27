@@ -445,10 +445,18 @@ class MooncakestoreConnector(RemoteConnector):
         return True
 
     async def exists(self, key: CacheEngineKey) -> bool:
-        return self.store.is_exist(key.to_string())
+        # _ensure_store() is required: the store is created lazily (fork-safe),
+        # and the lookup/contains path can run BEFORE any put/get on this
+        # instance (e.g. the first cross-instance request). Without it self.store
+        # is None, the lookup throws, is swallowed as a miss, and the instance
+        # recomputes instead of loading the peer's cached KV. Compare against 1
+        # (is_exist returns 1/0/-1) so an error never reads as a hit.
+        self._ensure_store()
+        return self.store.is_exist(key.to_string()) == 1
 
     def exists_sync(self, key: CacheEngineKey) -> bool:
-        return self.store.is_exist(key.to_string())
+        self._ensure_store()
+        return self.store.is_exist(key.to_string()) == 1
 
     async def batched_get(
         self, keys: List[CacheEngineKey]
