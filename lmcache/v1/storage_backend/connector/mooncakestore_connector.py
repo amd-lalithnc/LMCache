@@ -93,7 +93,14 @@ def setup_mooncake_store(
             caller (``TypeError`` is caught and used as the
             signal to fall back to the legacy API).
     """
-    setup_dict = config.setup_config
+    setup_dict = dict(config.setup_config)
+    # Mooncake's dict-based setup (store_py.cpp) reads the master address under
+    # the key "master_server_addr"; LMCache carries it as
+    # "master_server_address". Without this alias the key is silently dropped
+    # and the client defaults to 127.0.0.1:50051 -> ConnectToMaster fails
+    # (err=-900) in any multi-container/multi-host deployment.
+    if "master_server_address" in setup_dict and "master_server_addr" not in setup_dict:
+        setup_dict["master_server_addr"] = setup_dict["master_server_address"]
     try:
         # New API (Mooncake PR #1445): setup(config: dict)
         store.setup(setup_dict)
