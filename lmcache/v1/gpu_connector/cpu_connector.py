@@ -21,14 +21,22 @@ tensors. vLLM's CPU attention backend uses HND physical layout
 MemoryObj format produced/consumed: ``KV_2LTD`` = ``[2, num_layers, T, NH*HS]``.
 """
 
+# Standard
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 import os
-from typing import List, Optional, Union
 
+# Third Party
 import torch
 
+# First Party
 from lmcache.logging import init_logger
+from lmcache.v1.gpu_connector.interface import GPUConnectorInterface
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
+
+if TYPE_CHECKING:
+    # First Party
+    from lmcache.v1.gpu_connector.kv_format.types import LayoutHints
 
 logger = init_logger(__name__)
 
@@ -47,7 +55,7 @@ def _contiguous_view(t: torch.Tensor) -> torch.Tensor:
     return t.permute(perm)
 
 
-class VLLMCPUConnector:
+class VLLMCPUConnector(GPUConnectorInterface):
     """CPU gather/scatter between vLLM paged KV and an LMCache MemoryObj."""
 
     def __init__(
@@ -55,13 +63,19 @@ class VLLMCPUConnector:
         hidden_dim_size: int,
         num_layers: int,
         use_mla: bool = False,
-        **kwargs,
-    ):
+        kv_layout: Optional[str] = None,
+        **kwargs: Any,
+    ) -> None:
         self.hidden_dim_size = hidden_dim_size
         self.num_layers = num_layers
         self.use_mla = use_mla
-        # vLLM CPU backend uses HND. Override via env if a build differs.
-        self.kv_layout = os.environ.get("LMCACHE_CPU_KV_LAYOUT", "HND").upper()
+        # Physical KV layout precedence: explicit hint from the serving engine
+        # (passed via from_metadata's layout_hints), then the env override,
+        # then the vLLM CPU attention backend default (HND).
+        resolved_layout = (
+            kv_layout or os.environ.get("LMCACHE_CPU_KV_LAYOUT") or "HND"
+        )
+        self.kv_layout = resolved_layout.upper()
         self.kvcaches: Optional[List[torch.Tensor]] = None
         self._logged = False
 
@@ -76,17 +90,21 @@ class VLLMCPUConnector:
         metadata: LMCacheMetadata,
         use_gpu: bool = False,
         device: Optional[torch.device] = None,
-        layout_hints=None,
+        layout_hints: "Optional[LayoutHints]" = None,
     ) -> "VLLMCPUConnector":
         # kv_shape: (num_layer, 2 or 1, chunk_size, num_kv_head, head_size)
         num_layers = metadata.kv_shape[0]
         num_kv_head = metadata.kv_shape[3]
         head_size = metadata.kv_shape[4]
         hidden_dim_size = num_kv_head * head_size
+        # Honor the engine's layout hint when provided; __init__ falls back to
+        # the env override / HND default when this is None.
+        kv_layout = layout_hints.get("kv_layout") if layout_hints else None
         return cls(
             hidden_dim_size=hidden_dim_size,
             num_layers=num_layers,
             use_mla=metadata.use_mla,
+            kv_layout=kv_layout,
         )
 
     # ---- interface methods ---------------------------------------------------
@@ -97,11 +115,11 @@ class VLLMCPUConnector:
             [kv_size, self.num_layers, num_tokens, self.hidden_dim_size]
         )
 
-    def initialize_kvcaches_ptr(self, **kwargs) -> None:
+    def initialize_kvcaches_ptr(self, **kwargs: Any) -> None:
         if "kvcaches" in kwargs:
             self.kvcaches = kwargs["kvcaches"]
 
-    def _kv_token_views(self, layer: int):
+    def _kv_token_views(self, layer: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return (k_view, v_view), each a [NB, BS, NH, HS] view of the layer's
         paged cache, indexable as ``view[block_idx, off_idx] -> [.., NH, HS]``.
         Views alias storage so assignment writes through.
@@ -117,7 +135,9 @@ class VLLMCPUConnector:
         # NHD already [NB, BS, NH, HS]
         return k, v
 
-    def _block_offsets(self, slot_mapping: torch.Tensor, start: int, end: int, bs: int):
+    def _block_offsets(
+        self, slot_mapping: torch.Tensor, start: int, end: int, bs: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Negative slots are sentinels (PAD_SLOT_ID == -1, prefix-cache padding).
         # The CUDA kernel and python fallback SKIP them; we must too. Without a
         # guard, slot<0 makes block/off negative which silently wraps to the last
@@ -131,13 +151,13 @@ class VLLMCPUConnector:
         off = safe - block * bs
         return block, off, valid
 
-    def _log_once(self):
+    def _log_once(self) -> None:
         if self._logged:
             return
         self._logged = True
         t = self.kvcaches[0]
         ct = _contiguous_view(t)
-        logger.info(
+        logger.debug(
             "VLLMCPUConnector active: layers=%d hidden=%d layout=%s "
             "layer0 raw shape=%s stride=%s -> view shape=%s",
             self.num_layers,
@@ -148,11 +168,17 @@ class VLLMCPUConnector:
             tuple(ct.shape),
         )
 
-    def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
+    def from_gpu(
+        self, memory_obj: MemoryObj, start: int, end: int, **kwargs: Any
+    ) -> None:
         """STORE: gather vLLM paged KV (tokens [start,end)) into memory_obj."""
-        assert memory_obj.tensor is not None
+        if memory_obj.tensor is None:
+            raise ValueError("memory_obj.tensor must not be None")
         self.initialize_kvcaches_ptr(**kwargs)
-        assert self.kvcaches is not None
+        if self.kvcaches is None:
+            raise RuntimeError(
+                "kvcaches are not initialized; pass 'kvcaches' via kwargs"
+            )
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' must be provided")
         self._log_once()
@@ -178,11 +204,17 @@ class VLLMCPUConnector:
 
         memory_obj.metadata.fmt = MemoryFormat.KV_2LTD
 
-    def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
+    def to_gpu(
+        self, memory_obj: MemoryObj, start: int, end: int, **kwargs: Any
+    ) -> None:
         """LOAD: scatter memory_obj KV back into vLLM paged buffer."""
-        assert memory_obj.tensor is not None
+        if memory_obj.tensor is None:
+            raise ValueError("memory_obj.tensor must not be None")
         self.initialize_kvcaches_ptr(**kwargs)
-        assert self.kvcaches is not None
+        if self.kvcaches is None:
+            raise RuntimeError(
+                "kvcaches are not initialized; pass 'kvcaches' via kwargs"
+            )
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' must be provided")
         if memory_obj.metadata.fmt != MemoryFormat.KV_2LTD:
@@ -216,10 +248,14 @@ class VLLMCPUConnector:
             kview[b_sel, o_sel] = mt[0, layer, rows, :].reshape(-1, nh, hs)
             vview[b_sel, o_sel] = mt[1, layer, rows, :].reshape(-1, nh, hs)
 
-    def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
+    def batched_to_gpu(
+        self, memory_objs, starts, ends, **kwargs: Any
+    ) -> None:
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
             self.to_gpu(memory_obj, start, end, **kwargs)
 
-    def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
+    def batched_from_gpu(
+        self, memory_objs, starts, ends, **kwargs: Any
+    ) -> None:
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
             self.from_gpu(memory_obj, start, end, **kwargs)
