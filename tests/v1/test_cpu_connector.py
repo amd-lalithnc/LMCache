@@ -27,14 +27,20 @@ HS = 4  # head size
 HIDDEN = NH * HS
 
 
-def _make_kvcaches(layout: str, fill) -> list:
-    """Per-layer paged caches in the requested physical layout."""
+def _make_kvcaches(layout: str, fill, mode: str = "5d") -> list:
+    """Per-layer paged caches in the requested physical layout.
+
+    mode="5d": split K/V on a leading dim  -> [2, NB, NH, BS, HS] (HND) /
+               [2, NB, BS, NH, HS] (NHD).
+    mode="4d": vLLM CPU fused K/V on the last dim -> [NB, NH, BS, 2*HS] (HND) /
+               [NB, BS, NH, 2*HS] (NHD).
+    """
     caches = []
     for layer in range(NUM_LAYERS):
-        if layout == "HND":
-            shape = (2, NB, NH, BS, HS)
-        else:  # NHD
-            shape = (2, NB, BS, NH, HS)
+        if mode == "5d":
+            shape = (2, NB, NH, BS, HS) if layout == "HND" else (2, NB, BS, NH, HS)
+        else:  # 4d fused
+            shape = (NB, NH, BS, 2 * HS) if layout == "HND" else (NB, BS, NH, 2 * HS)
         caches.append(fill(shape, layer))
     return caches
 
@@ -52,13 +58,17 @@ def test_is_gpu_connector_interface_subclass():
 
 
 @pytest.mark.parametrize("layout", ["HND", "NHD"])
-def test_round_trip(layout):
+@pytest.mark.parametrize("mode", ["5d", "4d"])
+def test_round_trip(layout, mode):
     torch.manual_seed(0)
     conn = VLLMCPUConnector(
-        hidden_dim_size=HIDDEN, num_layers=NUM_LAYERS, kv_layout=layout
+        hidden_dim_size=HIDDEN,
+        num_layers=NUM_LAYERS,
+        kv_layout=layout,
+        head_size=HS,
     )
-    src = _make_kvcaches(layout, lambda shape, layer: torch.randn(*shape))
-    dst = _make_kvcaches(layout, lambda shape, layer: torch.zeros(*shape))
+    src = _make_kvcaches(layout, lambda shape, layer: torch.randn(*shape), mode)
+    dst = _make_kvcaches(layout, lambda shape, layer: torch.zeros(*shape), mode)
 
     tokens = NB * BS
     slots = torch.arange(tokens, dtype=torch.int64)
@@ -82,13 +92,17 @@ def test_round_trip(layout):
 
 
 @pytest.mark.parametrize("layout", ["HND", "NHD"])
-def test_sentinel_slots_skipped(layout):
+@pytest.mark.parametrize("mode", ["5d", "4d"])
+def test_sentinel_slots_skipped(layout, mode):
     torch.manual_seed(1)
     conn = VLLMCPUConnector(
-        hidden_dim_size=HIDDEN, num_layers=NUM_LAYERS, kv_layout=layout
+        hidden_dim_size=HIDDEN,
+        num_layers=NUM_LAYERS,
+        kv_layout=layout,
+        head_size=HS,
     )
-    src = _make_kvcaches(layout, lambda shape, layer: torch.randn(*shape))
-    dst = _make_kvcaches(layout, lambda shape, layer: torch.zeros(*shape))
+    src = _make_kvcaches(layout, lambda shape, layer: torch.randn(*shape), mode)
+    dst = _make_kvcaches(layout, lambda shape, layer: torch.zeros(*shape), mode)
 
     # token index 2 is a PAD_SLOT sentinel (-1) and must be skipped.
     slots = torch.tensor([0, 1, -1, 3], dtype=torch.int64)

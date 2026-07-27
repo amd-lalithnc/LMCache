@@ -10,7 +10,6 @@ import threading
 import torch
 
 # First Party
-from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
@@ -18,7 +17,6 @@ from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.protocol import RemoteMetadata
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
-from lmcache.v1.system_detection import NUMADetector
 
 logger = init_logger(__name__)
 
@@ -363,7 +361,7 @@ class MooncakestoreConnector(RemoteConnector):
         self.store = None
         self.replica_config = None
         self.registered_buffer_ptr = None
-        self._store_pid: Optional[int] = None
+        self._store_pid: int | None = None
         self._store_lock = threading.Lock()
         logger.info(
             "MooncakeConnector created (store creation deferred to first use)."
@@ -382,7 +380,17 @@ class MooncakestoreConnector(RemoteConnector):
             if self.store is not None and self._store_pid == pid:
                 return
             # Third Party
-            from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+            try:
+                from mooncake.store import (
+                    MooncakeDistributedStore,
+                    ReplicateConfig,
+                )
+            except ImportError as e:
+                raise ImportError(
+                    "Mooncake is not installed. Install the Mooncake transfer "
+                    "engine (e.g. `pip install mooncake-transfer-engine`) to use "
+                    "the Mooncake Store L2 backend."
+                ) from e
 
             logger.info(
                 "Setting up Mooncake store (pid=%d) with setup_config: %s",

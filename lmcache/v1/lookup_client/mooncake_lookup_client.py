@@ -45,7 +45,7 @@ class MooncakeLookupClient(LookupClientInterface):
             },
         )
         self.store = None
-        self._store_pid: Optional[int] = None
+        self._store_pid: int | None = None
         self._store_lock = threading.Lock()
 
         # Initialize token database for processing tokens
@@ -71,7 +71,14 @@ class MooncakeLookupClient(LookupClientInterface):
             if self.store is not None and self._store_pid == pid:
                 return
             # Third Party
-            from mooncake.store import MooncakeDistributedStore
+            try:
+                from mooncake.store import MooncakeDistributedStore
+            except ImportError as e:
+                raise ImportError(
+                    "Mooncake is not installed. Install the Mooncake transfer "
+                    "engine (e.g. `pip install mooncake-transfer-engine`) to use "
+                    "the Mooncake lookup client."
+                ) from e
 
             store = MooncakeDistributedStore()
             setup_mooncake_store(store, self._lookup_config)
@@ -84,7 +91,7 @@ class MooncakeLookupClient(LookupClientInterface):
         token_ids: Union[torch.Tensor, list[int]],
         lookup_id: Optional[str] = None,
         request_configs: Optional[dict] = None,
-    ) -> Optional[int]:
+    ) -> int | None:
         self._ensure_store()
         # process token_ids to cacheengine keys
         keys = []
