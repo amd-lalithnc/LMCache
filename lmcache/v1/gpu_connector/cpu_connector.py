@@ -64,11 +64,15 @@ class VLLMCPUConnector(GPUConnectorInterface):
         num_layers: int,
         use_mla: bool = False,
         kv_layout: Optional[str] = None,
+        head_size: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         self.hidden_dim_size = hidden_dim_size
         self.num_layers = num_layers
         self.use_mla = use_mla
+        # head_size is needed to split vLLM's fused-KV CPU layout (last dim =
+        # 2*head_size). Fall back to hidden_dim_size if not supplied.
+        self.head_size = head_size if head_size is not None else hidden_dim_size
         # Physical KV layout precedence: explicit hint from the serving engine
         # (passed via from_metadata's layout_hints), then the env override,
         # then the vLLM CPU attention backend default (HND).
@@ -105,6 +109,7 @@ class VLLMCPUConnector(GPUConnectorInterface):
             num_layers=num_layers,
             use_mla=metadata.use_mla,
             kv_layout=kv_layout,
+            head_size=head_size,
         )
 
     # ---- interface methods ---------------------------------------------------
@@ -123,11 +128,26 @@ class VLLMCPUConnector(GPUConnectorInterface):
         """Return (k_view, v_view), each a [NB, BS, NH, HS] view of the layer's
         paged cache, indexable as ``view[block_idx, off_idx] -> [.., NH, HS]``.
         Views alias storage so assignment writes through.
+
+        Handles two vLLM CPU layouts:
+          * 5-D ``[2, NB, NH, BS, HS]`` (HND) / ``[2, NB, BS, NH, HS]`` (NHD):
+            K/V split on the leading dim.
+          * 4-D ``[NB, NH, BS, 2*HS]`` (HND) / ``[NB, BS, NH, 2*HS]`` (NHD):
+            vLLM's CPU attention backend fuses K and V into the last dim
+            (first head_size = K, last head_size = V).
         """
         t = _contiguous_view(self.kvcaches[layer])
-        # t: [2, NB, *, *, HS]
-        k = t[0]
-        v = t[1]
+        if t.dim() == 5:
+            k, v = t[0], t[1]
+        elif t.dim() == 4 and t.shape[-1] == 2 * self.head_size:
+            hs = self.head_size
+            k, v = t[..., :hs], t[..., hs:]
+        else:
+            raise ValueError(
+                f"Unexpected CPU KV cache shape {tuple(t.shape)} "
+                f"(head_size={self.head_size}); expected 5-D [2,NB,NH,BS,HS] or "
+                f"4-D [NB,NH,BS,2*HS]"
+            )
         if self.kv_layout == "HND":
             # [NB, NH, BS, HS] -> [NB, BS, NH, HS]
             k = k.permute(0, 2, 1, 3)

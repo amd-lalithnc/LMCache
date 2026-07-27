@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, no_type_check
 import asyncio
 import json
 import os
+import threading
 
 # Third Party
 import torch
@@ -332,111 +333,67 @@ class MooncakestoreConnector(RemoteConnector):
         # initialize base class, which includes some common attributes
         super().__init__(local_cpu_backend.config, local_cpu_backend.metadata)
 
-        try:
-            # Third Party
-            from mooncake.store import (
-                MooncakeDistributedStore,
-                ReplicateConfig,
-            )
-        except ImportError as e:
-            raise ImportError(
-                "Please install mooncake by following the instructions at "
-                "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
-                "to run vLLM with MooncakeConnector."
-            ) from e
-
-        try:
-            self.store = MooncakeDistributedStore()
-            config_file_path = os.getenv("MOONCAKE_CONFIG_PATH")
-            if config_file_path is not None:
-                self.config = MooncakeStoreConfig.from_file(config_file_path)
-            elif lmcache_config is not None:
-                self.config = MooncakeStoreConfig.load_from_lmcache_config(
-                    lmcache_config
-                )
-            else:
-                raise ValueError("MOONCAKE_CONFIG_PATH/lmcache_config must be provided")
-
-            logger.info("Mooncake Configuration loaded. config: %s", self.config)
-
-            # Check if storage_root_dir exists and set env var
-            if self.config.storage_root_dir:
-                os.environ["MOONCAKE_STORAGE_ROOT_DIR"] = self.config.storage_root_dir
-                logger.info(
-                    "Set MOONCAKE_STORAGE_ROOT_DIR to: %s",
-                    self.config.storage_root_dir,
-                )
-
-            logger.info(
-                "Setting up Mooncake store with setup_config: %s",
-                _sanitize_setup_config(self.config.setup_config),
-            )
-
-            try:
-                numa_mapping = getattr(
-                    local_cpu_backend.memory_allocator, "numa_mapping", None
-                )
-                if numa_mapping is None and lmcache_config is not None:
-                    numa_mapping = NUMADetector.get_numa_mapping(lmcache_config)
-
-                if numa_mapping:
-                    current_device_id = torch_dev.current_device()
-                    gpu_to_numa = getattr(numa_mapping, "gpu_to_numa_mapping", {})
-                    numa_id = gpu_to_numa.get(current_device_id)
-                    logger.info(
-                        f"NUMA mapping detected (pre-Mooncake setup): {gpu_to_numa}"
-                    )
-                    try:
-                        # Third Party
-                        from mooncake.store import bind_to_numa_node
-
-                        if numa_id is not None:
-                            bind_to_numa_node(numa_id)
-                            logger.info(
-                                f"GPU {current_device_id}, "
-                                f"NUMA node {numa_id} binding done"
-                            )
-                        else:
-                            logger.info(
-                                f"NUMA mapping not found for GPU {current_device_id}"
-                            )
-                    except ImportError:
-                        logger.warning(
-                            "unable to import bind_to_numa_node from mooncake.store"
-                        )
-                else:
-                    logger.info("NUMA mapping unavailable or disabled")
-            except Exception as e:
-                logger.warning(
-                    f"Failed to determine NUMA mapping before Mooncake setup: {e}"
-                )
-
-            setup_mooncake_store(self.store, self.config)
-            logger.info("Mooncake store setup completed successfully")
-
-        except ValueError as e:
-            logger.error("Configuration loading failed: %s", e)
-            raise
-        except Exception as exc:
-            logger.error("An error occurred while loading the configuration: %s", exc)
-            raise
+        # Load config eagerly (cheap; no Go runtime). DEFER creating the Mooncake
+        # store/client to first use in the process that uses it: the client (Go
+        # runtime + multithreaded C++) is NOT fork-safe, and vLLM runs scheduler
+        # and worker in separate processes, so creating it here (possibly before
+        # a fork) yields an uninitialized/corrupt client and a segfault on the
+        # first transfer. _ensure_store() (re)creates it in the current process,
+        # guarded by PID for fork detection.
+        config_file_path = os.getenv("MOONCAKE_CONFIG_PATH")
+        if config_file_path is not None:
+            self.config = MooncakeStoreConfig.from_file(config_file_path)
+        elif lmcache_config is not None:
+            self.config = MooncakeStoreConfig.load_from_lmcache_config(lmcache_config)
+        else:
+            raise ValueError("MOONCAKE_CONFIG_PATH/lmcache_config must be provided")
+        logger.info("Mooncake Configuration loaded. config: %s", self.config)
+        if self.config.storage_root_dir:
+            os.environ["MOONCAKE_STORAGE_ROOT_DIR"] = self.config.storage_root_dir
 
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
+        self.store = None
+        self.replica_config = None
         self.registered_buffer_ptr = None
+        self._store_pid: Optional[int] = None
+        self._store_lock = threading.Lock()
+        logger.info(
+            "MooncakeConnector created (store creation deferred to first use)."
+        )
 
-        # Initialize ReplicateConfig
-        self.replica_config = ReplicateConfig()
-        self.replica_config.replica_num = 1
+    def _ensure_store(self) -> None:
+        """Create + set up the Mooncake store in the CURRENT process, lazily.
 
-        # Set preferred_segment based on configuration
-        if self.config.prefer_local_alloc:
-            self.replica_config.preferred_segment = self.store.get_hostname()
+        The Mooncake client is not fork-safe, so we (re)create it whenever the
+        PID changes. Thread-safe so concurrent ops don't race the first setup.
+        """
+        pid = os.getpid()
+        if self.store is not None and self._store_pid == pid:
+            return
+        with self._store_lock:
+            if self.store is not None and self._store_pid == pid:
+                return
+            # Third Party
+            from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
-        # Register CPU buffer for zero-copy operations
-        self._register_cpu_buffer()
-
-        logger.info("MooncakeConnector initialized successfully.")
+            logger.info(
+                "Setting up Mooncake store (pid=%d) with setup_config: %s",
+                pid,
+                _sanitize_setup_config(self.config.setup_config),
+            )
+            store = MooncakeDistributedStore()
+            setup_mooncake_store(store, self.config)
+            replica_config = ReplicateConfig()
+            replica_config.replica_num = 1
+            if self.config.prefer_local_alloc:
+                replica_config.preferred_segment = store.get_hostname()
+            self.store = store
+            self.replica_config = replica_config
+            self.registered_buffer_ptr = None
+            self._register_cpu_buffer()
+            self._store_pid = pid
+            logger.info("Mooncake store initialized successfully (pid=%d).", pid)
 
     def _register_cpu_buffer(self):
         """Register CPU buffer for zero-copy operations."""
@@ -495,6 +452,7 @@ class MooncakestoreConnector(RemoteConnector):
         """
         if not keys:
             return []
+        self._ensure_store()
 
         # Check if we have metadata for zero-copy operations
         if self.save_chunk_meta:
@@ -513,9 +471,13 @@ class MooncakestoreConnector(RemoteConnector):
         keys: List[CacheEngineKey],
         pin: bool = False,
     ) -> int:
+        self._ensure_store()
         num_hit_counts = 0
         for key in keys:
-            if not self.store.is_exist(key.to_string()):
+            # is_exist returns 1 (present), 0 (absent), or <0 on error. Only a
+            # definite 1 counts as a hit -- treating errors as hits caused loads
+            # from an uninitialized client (segfault).
+            if self.store.is_exist(key.to_string()) != 1:
                 break
             num_hit_counts += 1
         return num_hit_counts
@@ -683,6 +645,7 @@ class MooncakestoreConnector(RemoteConnector):
         Uses put_from (without metadata) or
         put_parts (with metadata) to match get behavior.
         """
+        self._ensure_store()
         key_str = key.to_string()
 
         # Check metadata handling mode to match get behavior
@@ -708,6 +671,7 @@ class MooncakestoreConnector(RemoteConnector):
         """
         if not keys:
             return
+        self._ensure_store()
 
         if self.save_chunk_meta:
             await self._batched_put_with_metadata(keys, memory_objs)

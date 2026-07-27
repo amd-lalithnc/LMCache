@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from typing import Optional, Union
+import os
+import threading
 
 # Third Party
 import torch
@@ -26,13 +28,12 @@ class MooncakeLookupClient(LookupClientInterface):
         metadata: LMCacheMetadata,
         master_addr: str,
     ):
-        # Third Party
-        from mooncake.store import MooncakeDistributedStore
-
-        self.store = MooncakeDistributedStore()
         # Deprecated
         # TODO(baoloongmao): use dict config instead in the future
-        lookup_config = MooncakeStoreConfig(
+        # DEFER store creation to first use in the current process: the Mooncake
+        # client (Go runtime + multithreaded C++) is not fork-safe, and this
+        # lookup client lives in the scheduler process which may fork workers.
+        self._lookup_config = MooncakeStoreConfig(
             setup_config={
                 "local_hostname": "localhost",
                 "metadata_server": "P2PHANDSHAKE",
@@ -43,7 +44,9 @@ class MooncakeLookupClient(LookupClientInterface):
                 "master_server_address": master_addr,
             },
         )
-        setup_mooncake_store(self.store, lookup_config)
+        self.store = None
+        self._store_pid: Optional[int] = None
+        self._store_lock = threading.Lock()
 
         # Initialize token database for processing tokens
         assert isinstance(config, LMCacheEngineConfig), (
@@ -58,12 +61,31 @@ class MooncakeLookupClient(LookupClientInterface):
         )
         self.token_database = ChunkedTokenDatabase(config, metadata)
 
+    def _ensure_store(self) -> None:
+        """Create + set up the Mooncake lookup store in the CURRENT process,
+        lazily; re-create on PID change since the client is not fork-safe."""
+        pid = os.getpid()
+        if self.store is not None and self._store_pid == pid:
+            return
+        with self._store_lock:
+            if self.store is not None and self._store_pid == pid:
+                return
+            # Third Party
+            from mooncake.store import MooncakeDistributedStore
+
+            store = MooncakeDistributedStore()
+            setup_mooncake_store(store, self._lookup_config)
+            self.store = store
+            self._store_pid = pid
+            logger.info("Mooncake lookup store initialized (pid=%d).", pid)
+
     def lookup(
         self,
         token_ids: Union[torch.Tensor, list[int]],
         lookup_id: Optional[str] = None,
         request_configs: Optional[dict] = None,
     ) -> Optional[int]:
+        self._ensure_store()
         # process token_ids to cacheengine keys
         keys = []
         ends = []
